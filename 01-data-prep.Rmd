@@ -2,7 +2,12 @@
 title: 'STUMBL: Prepare data'
 author: "George Kinnear"
 date: "26/03/2021"
-output: html_document
+always_allow_html: true
+output:
+  github_document:
+    html_preview: false
+  html_document:
+    toc: false
 ---
 
 
