@@ -1,0 +1,532 @@
+---
+title: 'STUMBL: Regression analysis'
+author: "George Kinnear"
+date: "26/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(janitor)
+
+# For raincloud plots
+source("R_rainclouds.R")
+lapply(packages, require, character.only = TRUE)
+# For Bayesian stats:
+library(bayestestR)
+library(insight)
+library(see)
+library(rstanarm)
+library(BayesFactor)
+library(modelbased)
+ci_width = 0.95  # Use 95% HDIs
+set.seed(12022021)
+
+# Set preferred styling
+theme_set(theme_minimal())
+colours_fac_vs_not = c("No FAC" = "#28c4d8", "FAC" = "#af003d")
+
+basic_kable = function(df) {
+  df %>% 
+    kable() %>%
+    kable_styling(bootstrap_options = "striped", full_width = F)
+}
+```
+
+
+# Exploring the FAC Effect
+
+```{r read-data}
+student_data <- read_csv("data-ANON/ANON_student-data.csv") %>% 
+  mutate(across(c(cohort, took_FAC), as.factor))
+```
+
+### Raincloud plot
+
+This shows the pattern of Pre/Post results for each cohort:
+
+```{r}
+fac_diagtest_change_data <- student_data %>% 
+  select(anon_id, cohort, took_FAC, Pre, Post) %>% 
+  filter(!is.na(Pre), !is.na(Post)) %>% 
+  pivot_longer(
+    cols = c("Pre", "Post"),
+    names_to = "diet",
+    values_to = "diagtest_score"
+  ) %>% 
+  mutate(diet = fct_relevel(diet, "Pre", "Post")) %>% 
+  mutate(took_FAC = as.factor(took_FAC))
+
+plot_diagtest_change <- fac_diagtest_change_data %>% 
+ggplot(aes(x = diet, y = diagtest_score, fill = took_FAC, colour = took_FAC)) +
+  geom_flat_violin(position = position_nudge(x = .1, y = 0), adjust = 1.5, trim = FALSE, alpha = .5, colour = NA)+
+  geom_point(aes(x = as.numeric(diet)-.35+.10*as.numeric(took_FAC)),position = position_jitter(width = .05), size = 1, shape = 20)+
+  geom_boxplot(outlier.shape = NA, alpha = .5, width = .1, colour = "black")+
+  scale_colour_manual("Group", values = colours_fac_vs_not)+
+  scale_fill_manual("Group", values = colours_fac_vs_not)+
+  labs(
+    x = "",
+    y = "Diagnostic Test score",
+    title = "Diagnostic Test scores pre/post"
+  ) +
+  coord_cartesian(ylim = c(0, 100))
+
+plot_diagtest_change +
+  facet_grid(cols = vars(cohort))
+```
+
+Here we group the cohorts together -- this is Figure 2 in the paper:
+
+```{r}
+plot_diagtest_change +
+  scale_colour_manual("Group", values = colours_fac_vs_not, labels = 
+    fac_diagtest_change_data %>% 
+      filter(diet == "Pre") %>% 
+      count(took_FAC) %>% 
+      mutate(n = str_glue("{took_FAC} (n={n})")) %>% 
+      deframe()
+  ) +
+  scale_fill_manual("Group", values = colours_fac_vs_not, labels = 
+    fac_diagtest_change_data %>% 
+      filter(diet == "Pre") %>% 
+      count(took_FAC) %>% 
+      mutate(n = str_glue("{took_FAC} (n={n})")) %>% 
+      deframe()
+  )
+ggsave("FIG_diagtest_change.pdf", width = 16, height = 12, units = "cm")
+```
+
+### Regression plots
+
+These plots show the various outcome measures in relation to Pre-test scores. The first plot splits up the cohorts for a visual check that they are consistent, and the second one shows the results for all cohorts grouped together.
+
+```{r}
+plot_regression_diagtest <- student_data %>% 
+  pivot_longer(
+    cols = c(Post, ILA, CAP, FAC),
+    names_to = "assessment",
+    values_to = "score"
+  ) %>% 
+  mutate(assessment = fct_relevel(assessment, "FAC", "Post", "ILA", "CAP")) %>% 
+  ggplot(aes(x = Pre, y = score, colour = took_FAC)) +
+  geom_point(alpha = 0.25) +
+  geom_smooth(method = "lm", formula = y ~ x, aes(fill = took_FAC), show.legend = FALSE)+ 
+  scale_colour_manual("Group", values = colours_fac_vs_not)+
+  coord_cartesian(ylim = c(0, 100), xlim = c(0, 100)) +
+  theme(legend.position = "right")
+
+plot_regression_diagtest +
+  facet_grid(cols = vars(assessment), rows = vars(cohort))
+
+plot_regression_diagtest +
+  facet_grid(cols = vars(assessment))
+```
+
+Now we will do the main Bayesian analyses.
+
+
+## Post-test
+
+
+### Linear regression
+
+We try fitting different models, starting with the "full" model `Post ~ Pre + took_FAC + Pre:took_FAC + cohort` and comparing this against models that remove the `cohort` and interaction terms.
+
+```{r regression-post}
+dat <- student_data %>%
+  select(cohort, anon_id, took_FAC, Pre, Post) %>%
+  drop_na()
+
+m0 <- lmBF(Post ~ Pre + took_FAC + Pre:took_FAC + cohort, data = dat)
+m1 <- lmBF(Post ~ Pre + took_FAC + cohort, data = dat)
+m2 <- lmBF(Post ~ Pre + took_FAC + Pre:took_FAC, data = dat)
+m3 <- lmBF(Post ~ Pre + took_FAC, data = dat)
+m4 <- lmBF(Post ~ Pre, data = dat)
+m5 <- lmBF(Post ~ took_FAC, data = dat)
+m6 <- lmBF(Post ~ Pre * took_FAC * cohort, data = dat)
+m7 <- lmBF(Post ~ Pre + took_FAC + cohort, data = dat)
+
+allBFs <- c(m0, m1, m2, m3, m4, m5, m6, m7)
+allBFs
+
+# https://easystats.github.io/bayestestR/articles/bayes_factors.html#bayesfactor_models
+comparison <- bayesfactor_models(allBFs / m7)
+
+comparison %>% 
+  mutate(
+    interp = effectsize::interpret_bf(BF, include_value = FALSE)
+    ) %>%
+  basic_kable()
+```
+
+There is very strong evidence for including the interaction between Pre-test and `took_FAC`. While it looks like there is strong evidence in favour of including the `cohort` in the model, that is just because it is part of a model that includes in the interaction term too -- the inclusion Bayes factors approach shows that only `Pre * took_FAC` has strong support for being in the model:
+
+```{r}
+bayesfactor_inclusion(comparison) %>% 
+  mutate(
+    interp = effectsize::interpret_bf(BF, include_value = TRUE)
+    ) %>%
+  arrange(-BF) %>% 
+  basic_kable()
+```
+
+```{r}
+# Fitting the model again using stan_glm this time, for compatability with helper functions
+model <- stan_glm(Post ~ Pre * took_FAC, data = dat,
+            refresh = 0 # to prevent messages about the MCMC iterations being printed
+            )
+```
+
+For the chosen model, we can inspect the posterior distributions for the means in the two groups, and the contrast between them:
+
+```{r}
+means <- modelbased::estimate_means(model)
+means %>%
+  basic_kable()
+modelbased::estimate_contrasts(model) %>%
+  basic_kable()
+```
+
+We can also replicate the regression picture, now based on the estimates given by the Bayesian model (i.e. predicted "Post" values for a given "Pre" score for the FAC/non-FAC groups):
+
+```{r}
+predicted <- modelbased::estimate_link(model)
+
+dat %>% 
+  group_by(cohort, took_FAC) %>% 
+  tally() %>% 
+  basic_kable()
+
+ns_diagtest <- dat %>% 
+  group_by(took_FAC) %>% 
+  tally() %>% 
+  mutate(label = str_glue("{took_FAC} (n={n})")) %>% 
+  select(took_FAC, label) %>% 
+  deframe()
+
+plot_diagtest_regression <- dat %>% 
+  ggplot(aes(x = Pre, fill = took_FAC)) +
+  geom_point(aes(y = Post), alpha = 0.25, shape = 21, colour = "transparent")+
+  geom_ribbon(data = predicted, aes(ymin = CI_low, ymax = CI_high), alpha = 0.3) +
+  geom_line(data = predicted, aes(y = Predicted, color = took_FAC), size = 1) +
+  scale_fill_manual("Group", values = colours_fac_vs_not, labels = ns_diagtest) +
+  scale_colour_manual("Group", values = colours_fac_vs_not, labels = ns_diagtest) +
+  labs(
+    x = "Diagnostic Test (September)",
+    y = "Diagnostic Test (January)",
+    title = "Comparing FAC and non-FAC students' Diagnostic Test results"
+  ) +
+  theme(
+    legend.position = "right"
+  )
+plot_diagtest_regression
+ggsave("FIG_diagtest_regression.pdf", width = 15, height = 10, units = "cm")
+
+```
+
+### ANOVA to get the contrasts
+
+```{r}
+fac_diagtest_change_data <- dat %>% 
+  pivot_longer(cols = c(Pre, Post), names_to = "diet", values_to = "diagtest_score")
+
+anova_model = stan_aov(
+  diagtest_score ~ took_FAC * diet,
+  data = fac_diagtest_change_data,
+  prior = NULL, # flat prior, see https://github.com/stan-dev/rstanarm/blob/dee0a2d45bf42b2df791072041151b753edd6af9/vignettes/lm.Rmd#L148
+  #prior = R2(0.1), # 
+  refresh = 0, # to prevent messages about the MCMC iterations being printed
+  seed = 13032021
+)
+anova_model
+
+rope(anova_model, ci = 0.95)
+
+anova_model_means <- modelbased::estimate_means(anova_model, ci = 0.95)
+anova_model_means %>% 
+  kable(digits = 2) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F) 
+
+anova_model_contrasts <- modelbased::estimate_contrasts(anova_model, ci = 0.95)
+anova_model_contrasts %>% 
+  kable(digits = 2) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
+
+Pulling these together into a neat summary:
+
+```{r}
+dt_change_anova_summary <- anova_model_contrasts %>% 
+  filter(str_detect(Level1, "Post") & str_detect(Level2, "Pre")) %>% 
+  mutate(across(starts_with("Level"), ~ str_replace(., " Pre| Post", ""))) %>% 
+  filter(Level1==Level2) %>% 
+  transmute(
+    took_fac = Level1,
+    diet = "change",
+    mean = Difference,
+    ci_low = CI_low,
+    ci_high = CI_high
+  ) %>% 
+  bind_rows(anova_model_means %>% rename_with(tolower)) %>% 
+  mutate(across(where(is.numeric), ~ round(., digits = 1))) %>% 
+  mutate(ci = str_glue("[{ci_low}, {ci_high}]")) %>% 
+  select(-contains("ci_")) %>% 
+  pivot_wider(
+    names_from = "diet",
+    values_from = c(mean, ci),
+    names_glue = "{diet}_{.value}"
+  ) %>% 
+  left_join(dat %>% group_by(took_FAC) %>% tally(), by = c("took_fac" = "took_FAC")) %>% 
+  select(took_fac, n, sort(current_vars(), decreasing = TRUE))
+
+options(knitr.kable.NA = '-')
+dt_change_anova_summary %>% 
+  kable(
+    col.names = c("", "N", rep(c("Mean", "95% HDI"), 3)),
+    booktabs = TRUE,
+    caption = "Table 4 in the paper",
+    #format = "latex"
+  ) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F) %>%
+  add_header_above(c(" " = 2, "Pre-test" = 2, "Post-test" = 2, "Gain" = 2))
+```
+
+
+
+## ILA
+
+
+### Linear regression
+
+We try fitting different models, starting with the "full" model `Post ~ Pre + took_FAC + Pre:took_FAC + cohort` and comparing this against models that remove the `cohort` and interaction terms.
+
+```{r regression-ila}
+dat <- student_data %>%
+  select(cohort, anon_id, took_FAC, Pre, ILA) %>%
+  drop_na()
+
+m0 <- lmBF(ILA ~ Pre + took_FAC + Pre:took_FAC + cohort, data = dat)
+m1 <- lmBF(ILA ~ Pre + took_FAC + cohort, data = dat)
+m2 <- lmBF(ILA ~ Pre + took_FAC + Pre:took_FAC, data = dat)
+m3 <- lmBF(ILA ~ Pre + took_FAC, data = dat)
+m4 <- lmBF(ILA ~ Pre, data = dat)
+m5 <- lmBF(ILA ~ took_FAC, data = dat)
+m6 <- lmBF(ILA ~ Pre * took_FAC * cohort, data = dat)
+m7 <- lmBF(ILA ~ Pre + took_FAC + cohort, data = dat)
+
+allBFs <- c(m0, m1, m2, m3, m4, m5, m6, m7)
+allBFs
+
+# https://easystats.github.io/bayestestR/articles/bayes_factors.html#bayesfactor_models
+comparison <- bayesfactor_models(allBFs / m7)
+
+comparison %>% 
+  mutate(
+    interp = effectsize::interpret_bf(BF, include_value = FALSE)
+    ) %>%
+  basic_kable()
+```
+
+This time there is moderate evidence against including the interaction term (i.e. the regression lines for FAC and non-FAC students are the same), and extreme evidence for including the cohort term:
+
+```{r}
+bayesfactor_inclusion(comparison) %>% 
+  mutate(
+    interp = effectsize::interpret_bf(BF, include_value = TRUE)
+    ) %>%
+  basic_kable()
+```
+
+```{r}
+# Fitting the model again using stan_glm this time, for compatability with helper functions
+model <- stan_glm(ILA ~ Pre + took_FAC + cohort, data = dat,
+            refresh = 0 # to prevent messages about the MCMC iterations being printed
+            )
+```
+
+For the chosen model, we can inspect the posterior distributions for the means in the two groups, and the contrast between them:
+
+```{r}
+means <- modelbased::estimate_means(model)
+means %>%
+  basic_kable()
+modelbased::estimate_contrasts(model) %>%
+  basic_kable()
+modelbased::estimate_contrasts(model, levels = "took_FAC") %>%
+  basic_kable()
+modelbased::estimate_contrasts(model, levels = "cohort") %>%
+  basic_kable()
+```
+
+We can also replicate the regression picture, now based on the estimates given by the Bayesian model (i.e. predicted "ILA" values for a given "Pre" score for the FAC/non-FAC groups):
+
+```{r}
+predicted <- modelbased::estimate_link(model)
+
+dat %>% 
+  group_by(cohort, took_FAC) %>% 
+  tally() %>% 
+  basic_kable()
+
+ns_ILA <- dat %>% 
+  filter(cohort == "1819") %>% 
+  group_by(took_FAC) %>% 
+  tally() %>% 
+  mutate(label = str_glue("{took_FAC} (n={n})")) %>% 
+  select(took_FAC, label) %>% 
+  deframe()
+
+plot_ILA_regression <- dat %>% 
+  filter(cohort == "1819") %>% 
+  ggplot(aes(x = Pre, fill = took_FAC)) +
+  geom_point(aes(y = ILA), alpha = 0.25, shape = 21, colour = "transparent")+
+  geom_ribbon(data = predicted %>% filter(cohort == "1819"), aes(ymin = CI_low, ymax = CI_high), alpha = 0.3) +
+  geom_line(data = predicted %>% filter(cohort == "1819"), aes(y = Predicted, color = took_FAC), size = 1) +
+  scale_fill_manual("Group", values = colours_fac_vs_not, labels = ns_ILA) +
+  scale_colour_manual("Group", values = colours_fac_vs_not, labels = ns_ILA) +
+  labs(
+    x = "Diagnostic Test (September)",
+    y = "ILA result",
+    title = "Comparing FAC and non-FAC students' ILA results: 1819 cohort"
+  ) +
+  theme(
+    legend.position = "right"
+  )
+plot_ILA_regression
+ggsave("FIG_ILA_regression.pdf", width = 15, height = 10, units = "cm")
+
+```
+
+
+
+## CAP
+
+### Linear regression
+
+We try fitting different models, starting with the "full" model `Post ~ Pre + took_FAC + Pre:took_FAC + cohort` and comparing this against models that remove the `cohort` and interaction terms.
+
+```{r regression-cap}
+dat <- student_data %>%
+  select(cohort, anon_id, took_FAC, Pre, CAP) %>%
+  drop_na()
+
+m0 <- lmBF(CAP ~ Pre + took_FAC + Pre:took_FAC + cohort, data = dat)
+m1 <- lmBF(CAP ~ Pre + took_FAC + cohort, data = dat)
+m2 <- lmBF(CAP ~ Pre + took_FAC + Pre:took_FAC, data = dat)
+m3 <- lmBF(CAP ~ Pre + took_FAC, data = dat)
+m4 <- lmBF(CAP ~ Pre, data = dat)
+m5 <- lmBF(CAP ~ took_FAC, data = dat)
+m6 <- lmBF(CAP ~ Pre * took_FAC * cohort, data = dat)
+m7 <- lmBF(CAP ~ Pre + took_FAC + cohort, data = dat)
+
+allBFs <- c(m0, m1, m2, m3, m4, m5, m6, m7)
+allBFs
+
+# https://easystats.github.io/bayestestR/articles/bayes_factors.html#bayesfactor_models
+comparison <- bayesfactor_models(allBFs / m7)
+
+comparison %>% 
+  mutate(
+    interp = effectsize::interpret_bf(BF, include_value = FALSE)
+    ) %>%
+  basic_kable()
+```
+
+This time there is moderate evidence against including the interaction term (i.e. the regression lines for FAC and non-FAC students are the same), and extreme evidence for including the cohort term:
+
+```{r}
+bayesfactor_inclusion(comparison) %>% 
+  mutate(
+    interp = effectsize::interpret_bf(BF, include_value = TRUE)
+    ) %>%
+  basic_kable()
+```
+
+```{r}
+# Fitting the model again using stan_glm this time, for compatability with helper functions
+model <- stan_glm(CAP ~ Pre + took_FAC + cohort, data = dat,
+            refresh = 0 # to prevent messages about the MCMC iterations being printed
+            )
+```
+
+For the chosen model, we can inspect the posterior distributions for the means in the two groups, and the contrast between them:
+
+```{r}
+means <- modelbased::estimate_means(model)
+means %>%
+  basic_kable()
+modelbased::estimate_contrasts(model) %>%
+  basic_kable()
+modelbased::estimate_contrasts(model, levels = "took_FAC") %>%
+  basic_kable()
+modelbased::estimate_contrasts(model, levels = "cohort") %>%
+  basic_kable()
+```
+
+We can also replicate the regression picture, now based on the estimates given by the Bayesian model (i.e. predicted "CAP" values for a given "Pre" score for the FAC/non-FAC groups):
+
+```{r}
+predicted <- modelbased::estimate_link(model)
+
+dat %>% 
+  group_by(cohort, took_FAC) %>% 
+  tally() %>% 
+  basic_kable()
+
+ns_CAP <- dat %>% 
+  filter(cohort == "1819") %>% 
+  group_by(took_FAC) %>% 
+  tally() %>% 
+  mutate(label = str_glue("{took_FAC} (n={n})")) %>% 
+  select(took_FAC, label) %>% 
+  deframe()
+
+plot_CAP_regression <- dat %>% 
+  filter(cohort == "1819") %>% 
+  ggplot(aes(x = Pre, fill = took_FAC)) +
+  geom_point(aes(y = CAP), alpha = 0.25, shape = 21, colour = "transparent")+
+  geom_ribbon(data = predicted %>% filter(cohort == "1819"), aes(ymin = CI_low, ymax = CI_high), alpha = 0.3) +
+  geom_line(data = predicted %>% filter(cohort == "1819"), aes(y = Predicted, color = took_FAC), size = 1) +
+  scale_fill_manual("Group", values = colours_fac_vs_not, labels = ns_CAP) +
+  scale_colour_manual("Group", values = colours_fac_vs_not, labels = ns_CAP) +
+  labs(
+    x = "Diagnostic Test (September)",
+    y = "CAP result",
+    title = "Comparing FAC and non-FAC students' CAP results: 1819 cohort"
+  ) +
+  theme(
+    legend.position = "right"
+  )
+plot_CAP_regression
+ggsave("FIG_CAP_regression.pdf", width = 15, height = 10, units = "cm")
+
+```
+
+This is the summary plot used in the paper:
+
+```{r}
+library(patchwork)
+
+plot_diagtest_regression + labs(title = "Post-test", subtitle = "All cohorts", x = "", y = "") +
+  plot_ILA_regression + labs(title = "ILA", subtitle = "2018/19 cohort", x = "Pre-test", y = "") +
+  plot_CAP_regression + labs(title = "CAP", subtitle = "2018/19 cohort", x = "", y = "") &
+  #plot_layout(guides = 'collect') &
+  # plot_annotation(title = "Comparing FAC and non-FAC student outcomes",
+  #                 #tag_levels = 'a', tag_prefix = "(", tag_suffix = ")"
+  #                 )
+  theme(
+    legend.position='top',
+    legend.title = element_blank(),
+    legend.text=element_text(size=8)
+  ) &
+  #guides(color = guide_legend(ncol = 2, override.aes = list(size = 0.25))) &
+  guides(fill = guide_legend(ncol = 2, override.aes = list(size = 0.25))) &
+  theme(plot.margin = margin(0.1,0.1,0.1,0, "cm"),
+        plot.subtitle = element_text(margin=margin(0,0,10,0)),
+        legend.box.just = "left") &
+  theme(legend.position = c(0.5, 1.02), legend.key.size = unit(0.3, "cm"))
+ggsave("FIG_three_regression.pdf", width = 20, height = 9, units = "cm")
+```

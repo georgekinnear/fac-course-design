@@ -1,0 +1,298 @@
+---
+title: 'STUMBL: Prepare data'
+author: "George Kinnear"
+date: "26/03/2021"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(janitor)
+
+# Set preferred styling
+theme_set(theme_minimal())
+colours_fac_vs_not = c("No FAC" = "#28c4d8", "FAC" = "#af003d")
+
+basic_kable = function(df) {
+  df %>% 
+    kable() %>%
+    kable_styling(bootstrap_options = "striped", full_width = F)
+}
+```
+
+# Data sources
+
+## Diagnostic Test response data
+
+```{r message=FALSE, warning=FALSE}
+
+diagtest_files <- fs::dir_ls(path = "data-ANON", regexp = ".*diagtest.*")
+
+diagtest_results_all <- tibble(path = diagtest_files) %>% 
+  # add columns describing the course and cohort from parsing the filename
+  mutate(
+    cohort = str_extract(path, "(?<=ANON_)(.*)(?=diagtest)"),
+    diet = case_when(
+      str_detect(path, "Sep") ~ "Pre",
+      str_detect(path, "Jan") ~ "Post"
+    )
+  ) %>% 
+  mutate(diet = fct_relevel(diet, "Pre", "Post")) %>% 
+  # read in the file contents
+  mutate(
+    csv_contents = map(path, read_csv, na = c("-"))
+  ) %>% 
+  # unpack all the results and tidy up
+  unnest(cols = c(csv_contents)) %>% 
+  janitor::clean_names() %>% 
+  # csv path is no longer needed
+  select(-path) %>% 
+  rename_with(~ gsub("_5_00", "", .x, fixed = TRUE)) %>% 
+  rename(total = grade_100_00)
+
+```
+Number of responses:
+
+```{r}
+diagtest_results_all %>% 
+  group_by(cohort, diet) %>% 
+  summarise(
+    n = n(),
+    diagtest_mean = mean(total, na.rm = TRUE),
+    diagtest_sd = sd(total, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  basic_kable() %>% 
+  collapse_rows(columns = 1:2, valign = "top")
+```
+
+## Demographic data
+
+We have demographic data available -- while we don't make use of this in analyses, we need to use this to determine which students are enrolled on which courses in each year, particularly for 2020/21 CAP where there are no results available for that yet.
+
+```{r}
+demographics <- read_csv("data-ANON/ANON_demographics.csv") %>% 
+  # There are very few class only or exam only enrolments, and they are not relevant for us
+  filter(!str_detect(course_mode_of_study, "Class Only|Exam only")) %>% 
+  # neaten up the values
+  mutate(
+    cohort = case_when(
+      course_year_code == "2018/9" ~ "1819",
+      course_year_code == "2019/0" ~ "1920",
+      course_year_code == "2020/1" ~ "2021",
+    ),
+    course = case_when(
+      str_detect(course_code_title, "MATH08057") ~ "ILA",
+      str_detect(course_code_title, "MATH08058") ~ "CAP",
+      str_detect(course_code_title, "MATH07003") ~ "FAC",
+    )
+  )
+
+demographics %>%
+  select(AnonID, cohort, course) %>% 
+  distinct() %>% 
+  tabyl(course, cohort) %>%
+  basic_kable()
+```
+
+## All course results
+
+```{r}
+results_all <-
+  read_csv("data-ANON/ANON_all_course_results.csv") %>%
+  janitor::clean_names() %>%
+  select(anon_id, course_year, course_code, course_name, assessment_mark) %>% 
+  filter(course_code %in% c("MATH07003", "MATH08057", "MATH08058")) %>% 
+  mutate(
+    cohort = case_when(
+      course_year == "2018/9" ~ "1819",
+      course_year == "2019/0" ~ "1920",
+      course_year == "2020/1" ~ "2021",
+    ),
+    course = case_when(
+      course_code == "MATH07003" ~ "FAC",
+      course_code == "MATH08057" ~ "ILA",
+      course_code == "MATH08058" ~ "CAP",
+    )
+  ) %>%
+  select(anon_id, cohort, course, assessment_mark) %>% 
+  # filter out the small number of students on CAP 2021 who score 0 already because they withdrew mid-semester
+  filter(!(course == "CAP" & cohort == "2021"))
+
+results_all %>% 
+  tabyl(cohort, course) %>%
+  adorn_totals(c("row", "col")) %>%
+  basic_kable()
+```
+
+Combining these with Diagnostic Test pre/post results:
+
+```{r}
+diagtest_wide <- diagtest_results_all %>% 
+  select(cohort, diet, anon_id, total) %>% 
+  semi_join(demographics, by = c("anon_id" = "AnonID")) %>% 
+  pivot_wider(
+    names_from = diet,
+    values_from = total,
+    values_fn = max
+  ) %>% 
+  mutate(
+    diagtest_group = case_when(
+      !is.na(Pre) & !is.na(Post) ~ "Both",
+      !is.na(Pre) ~ "Pre only",
+      !is.na(Post) ~ "Post only",
+      TRUE ~ "Neither"
+    )
+  )
+
+results_all_wide <- results_all %>% 
+  pivot_wider(
+    names_from = course,
+    values_from = assessment_mark,
+    values_fn = max
+  )
+
+diagtest_plus_results_wide <- diagtest_wide %>% 
+  full_join(results_all_wide, by = c("cohort", "anon_id")) %>% 
+  mutate(took_FAC = as.factor(ifelse(is.na(FAC), "No FAC", "FAC")))
+
+diagtest_plus_results_summary <- diagtest_plus_results_wide %>% 
+  group_by(cohort) %>% 
+  rename(student = anon_id) %>% 
+  summarise(
+    across(
+      c(student, Post, FAC, ILA, CAP),
+      list(
+        total = ~ sum(!is.na(.)),
+        withPre = ~ sum(!is.na(.) & !is.na(Pre)),
+        pc = ~ sum(!is.na(.) & !is.na(Pre))/sum(!is.na(.))
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  )
+
+n_summary_reshaped <- diagtest_plus_results_summary %>% 
+  pivot_longer(
+    cols = contains("_"),
+    names_to = "field",
+    values_to = "value"
+  ) %>% 
+  separate(field, into = c("item", "detail"), sep = "_") %>% 
+  filter(!(item =="CAP" & cohort == "2021")) %>% 
+  mutate(item = str_replace(item, "student", "All students")) %>% 
+  mutate(item = str_replace(item, "Post", "Took Post-test")) %>% 
+  pivot_wider(
+    names_from = "detail",
+    values_from = "value"
+  ) %>% 
+  mutate(
+    withPre = paste0(withPre, " (", round(pc*100,0), "%)")
+  ) %>% 
+  select(-pc) %>% 
+  pivot_wider(
+    id_cols = c(cohort, item),
+    names_from = "cohort",
+    values_from = c(total, withPre),
+    names_glue = "{cohort}_{.value}"
+  ) %>% 
+  select(item, sort(current_vars()))
+
+options(knitr.kable.NA = '-')
+n_summary_reshaped %>% 
+  kable(
+    col.names = c("", rep(c("N", "Took Pre-test"), 3)),
+    booktabs = TRUE,
+    caption = "Table 3 in the paper",
+    #format = "latex"
+  ) %>%
+  kable_styling(bootstrap_options = "striped", full_width = F) %>%
+  add_header_above(c(" " = 1, "2018/19" = 2, "2019/20" = 2, "2020/21" = 2))
+
+
+```
+
+## Results distributions
+
+Histograms of results in each of the three courses:
+
+```{r}
+results_all %>% 
+  bind_rows(
+    diagtest_results_all %>% select(cohort, course = diet, anon_id, assessment_mark = total) %>% 
+      mutate(course = paste0(course, "-test"))
+  ) %>% 
+  mutate(course = fct_relevel(course, "Pre-test", "Post-test", "FAC", "ILA", "CAP")) %>% 
+  mutate(cohort = paste0("20", str_sub(cohort, 1, 2), "/", str_sub(cohort, 3, 4))) %>% 
+  ggplot(aes(x = assessment_mark)) +
+  #geom_density() +
+  geom_histogram(binwidth = 5, colour = "white", size = 0.1) +
+  facet_grid(cols = vars(cohort), rows = vars(course), scales = "free", switch = "y") +
+  labs(x = "Course result", y = "") +
+  theme(
+    strip.text.y.left = element_text(angle = 0),
+    strip.placement = "outside"
+  )
+ggsave("FIG_course_results_histogram.pdf", width = 20, height = 18, units = "cm")
+
+```
+
+
+
+# Students with pre-post data
+
+For pre-post analyses, we restrict to students who were enrolled on one of FAC/ILA/CAP (i.e. to exclude the many engineering students who only take the diagnostic test in September).
+
+
+```{r}
+diagtest_wide <- diagtest_results_all %>% 
+  select(cohort, diet, anon_id, total) %>% 
+  semi_join(demographics, by = c("anon_id" = "AnonID")) %>% 
+  pivot_wider(
+    names_from = diet,
+    values_from = total,
+    values_fn = max
+  ) %>% 
+  mutate(
+    data_group = case_when(
+      !is.na(Pre) & !is.na(Post) ~ "Both",
+      !is.na(Pre) ~ "Pre only",
+      !is.na(Post) ~ "Post only",
+      TRUE ~ "Neither"
+    )
+  )
+
+```
+
+We assemble the available data for exploring the ""FAC Effect"", saving it as `data-ANON/ANON_student-data.csv`.
+
+```{r assemble-fac-effect-data}
+
+measures = tibble("meas" = c("Post", "ILA", "CAP")) %>% 
+  mutate(
+    meas_data_all = map(meas, function(meas) diagtest_plus_results_wide %>% 
+      select(cohort, anon_id, took_FAC, Pre, outcome = meas) %>%
+      filter(!is.na(outcome))
+      #select(cohort, anon_id, took_FAC, Pre, meas) %>%
+      #filter(!is.na(!!as.symbol(meas)))
+      ),
+    N_total = map_int(meas_data_all, nrow),
+    meas_data = map(meas_data_all, function(dat) dat %>% 
+        filter(!is.na(Pre))
+      ),
+    N_with_Pre = map_int(meas_data, nrow),
+    pc = N_with_Pre / N_total
+  )
+
+measures %>% 
+  select(meas, contains("N"), pc)  %>%
+  basic_kable()
+
+diagtest_plus_results_wide %>% 
+  select(-diagtest_group) %>% 
+  write_csv("data-ANON/ANON_student-data.csv")
+  
+```
